@@ -15,12 +15,16 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <inttypes.h>
 
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
 #define MODE_FILE      0100644
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
+
+// Forward declaration (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
@@ -116,6 +120,106 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 
 // ─── TODO: Implement these ──────────────────────────────────────────────────
 
+// Minimal index entry struct (local to tree.c to avoid dependency on index.h)
+typedef struct {
+    uint32_t mode;
+    ObjectID hash;
+    uint64_t mtime_sec;
+    uint32_t size;
+    char path[512];
+} LocalIndexEntry;
+
+// Helper: recursively build tree from entries filtered by prefix
+static int build_tree_recursive(LocalIndexEntry *filtered_entries, int count, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+    
+    int i = 0;
+    while (i < count && tree.count < MAX_TREE_ENTRIES) {
+        const char *path = filtered_entries[i].path;
+        const char *slash = strchr(path, '/');
+        
+        if (!slash) {
+            // This is a file (no more slashes)
+            tree.entries[tree.count].mode = filtered_entries[i].mode;
+            tree.entries[tree.count].hash = filtered_entries[i].hash;
+            strcpy(tree.entries[tree.count].name, path);
+            tree.count++;
+            i++;
+        } else {
+            // This is a directory - collect all entries for this directory
+            size_t dir_len = slash - path;
+            char dir_name[256];
+            memcpy(dir_name, path, dir_len);
+            dir_name[dir_len] = '\0';
+            
+            // Check if already added
+            int already_added = 0;
+            for (int j = 0; j < tree.count; j++) {
+                if (strcmp(tree.entries[j].name, dir_name) == 0) {
+                    already_added = 1;
+                    break;
+                }
+            }
+            
+            if (!already_added) {
+                // Collect all entries in this directory
+                LocalIndexEntry subentries[MAX_TREE_ENTRIES];
+                int subcount = 0;
+                
+                for (int j = i; j < count; j++) {
+                    if (strncmp(filtered_entries[j].path, dir_name, dir_len) == 0 &&
+                        filtered_entries[j].path[dir_len] == '/') {
+                        // Strip the directory prefix
+                        LocalIndexEntry sub = filtered_entries[j];
+                        strcpy(sub.path, filtered_entries[j].path + dir_len + 1);
+                        subentries[subcount++] = sub;
+                    }
+                }
+                
+                // Recursively build subtree
+                ObjectID subid;
+                if (build_tree_recursive(subentries, subcount, &subid) != 0) {
+                    return -1;
+                }
+                
+                // Add directory to tree
+                tree.entries[tree.count].mode = MODE_DIR;
+                tree.entries[tree.count].hash = subid;
+                strcpy(tree.entries[tree.count].name, dir_name);
+                tree.count++;
+                
+                // Skip all entries in this directory
+                while (i < count && 
+                       strncmp(filtered_entries[i].path, dir_name, dir_len) == 0 &&
+                       filtered_entries[i].path[dir_len] == '/') {
+                    i++;
+                }
+            } else {
+                i++;
+            }
+        }
+    }
+    
+    // Serialize and write tree
+    void *data;
+    size_t len;
+    if (tree_serialize(&tree, &data, &len) != 0) {
+        return -1;
+    }
+    
+    int result = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return result;
+}
+
+// Forward declaration (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
+// Forward declarations for hash conversion (implemented in object.c)
+void hash_to_hex(const ObjectID *id, char *hex_out);
+int hex_to_hash(const char *hex, ObjectID *id_out);
+
 // Build a tree hierarchy from the current index and write all tree
 // objects to the object store.
 //
@@ -130,8 +234,53 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //
 // Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    // Load the index from .pes/index directly
+    LocalIndexEntry entries[4096]; // Local entries array
+    int entry_count = 0;
+    
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) {
+        // If index doesn't exist, create an empty tree
+        Tree empty_tree;
+        empty_tree.count = 0;
+        void *data;
+        size_t len;
+        if (tree_serialize(&empty_tree, &data, &len) != 0) {
+            return -1;
+        }
+        int result = object_write(OBJ_TREE, data, len, id_out);
+        free(data);
+        return result;
+    }
+    
+    char hex_hash[HASH_HEX_SIZE + 1];
+    char path[512];
+    
+    while (entry_count < 4096) {
+        int ret = fscanf(f, "%o %64s %" SCNu64 " %" SCNu32 " %511s\n",
+                         &entries[entry_count].mode,
+                         hex_hash,
+                         &entries[entry_count].mtime_sec,
+                         &entries[entry_count].size,
+                         path);
+        
+        if (ret != 5) {
+            break; // EOF or parse error
+        }
+        
+        if (hex_to_hash(hex_hash, &entries[entry_count].hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+        
+        strncpy(entries[entry_count].path, path, sizeof(entries[entry_count].path) - 1);
+        entries[entry_count].path[sizeof(entries[entry_count].path) - 1] = '\0';
+        
+        entry_count++;
+    }
+    
+    fclose(f);
+    
+    // Build tree hierarchy from all entries
+    return build_tree_recursive(entries, entry_count, id_out);
 }
